@@ -83,13 +83,23 @@ def severity(score, ref):
 # --------------------------------------------------------------------------- comandos
 
 def cmd_ifaces(args):
-    from scapy.all import get_if_list, get_if_addr
-    for name in get_if_list():
-        try:
-            addr = get_if_addr(name)
-        except Exception:
-            addr = '?'
-        print(f"  {name}  {addr}")
+    """Interfaces con IP utilizable. --all incluye las que no la tienen."""
+    from scapy.all import conf
+    rows = []
+    for i in conf.ifaces.values():
+        ip = getattr(i, 'ip', None) or ''
+        # 0.0.0.0 = sin configurar, 169.254.x = APIPA (sin conectividad real)
+        usable = ip and not ip.startswith(('0.', '169.254.'))
+        if usable or args.all:
+            rows.append((' *' if i == conf.iface else '  ',
+                         ip or '-', i.description or i.name, i.name))
+    for mark, ip, desc, name in sorted(rows, key=lambda r: r[1], reverse=True):
+        print(f"{mark} {ip:<16} {desc}")
+        if args.verbose:
+            print(f"     {name}")
+    print("\n  * = interfaz por defecto (la de la ruta por defecto)")
+    if not args.all:
+        print("  --all para ver tambien las que no tienen IP utilizable")
 
 
 def cmd_capture(args):
@@ -161,42 +171,83 @@ def cmd_detect(args):
     print(f"[+] {args.model}: {b.get('samples', '?')} muestras, umbral {thr:.4f}")
     print(f"[+] Escucha pasiva en {args.iface or 'interfaz por defecto'}. Ctrl-C para parar.")
 
+    # Puntuar paquete a paquete cuesta ~4 ms (techo ~250 pkt/s, por debajo de una
+    # Wi-Fi domestica). En lote son ~2 us/paquete: el coste es montar el DataFrame
+    # y entrar al modelo, no el arbol. De ahi el buffer.
+    pending, last = [], time.time()
+
+    def score_batch(rows):
+        X = featurize(pd.DataFrame(rows))[feats]
+        for row, s in zip(rows, model.score_samples(X)):
+            if s >= thr:
+                continue
+            key = f"{row['src_ip']}:{row['sport']} > {row['dst_ip']}:{row['dport']}"
+            now = time.time()
+            if now - seen.get(key, 0) < args.cooldown:
+                continue
+            seen[key] = now
+            print(f"\n[!] {row['timestamp']}  score {s:.4f}  severidad {severity(s, ref)}%")
+            print(f"    {key}  proto {row['proto']}  {row['length']} B "
+                  f"(payload {row['payload_len']} B)")
+
+    def flush():
+        nonlocal last
+        if pending:
+            rows, last = pending.copy(), time.time()
+            pending.clear()
+            score_batch(rows)
+
     def handle(pkt):
         if IP not in pkt:
             return
         row = row_from_pkt(pkt)
         if row['sport'] in white or row['dport'] in white or row['length'] < args.min_length:
             return
-        # ponytail: un score_samples por paquete (~1 ms). Si satura, acumular en
-        # lotes de N paquetes y puntuar el lote de golpe.
-        s = float(model.score_samples(featurize(pd.DataFrame([row]))[feats])[0])
-        if s >= thr:
-            return
-        key = f"{row['src_ip']}:{row['sport']} > {row['dst_ip']}:{row['dport']}"
-        now = time.time()
-        if now - seen.get(key, 0) < args.cooldown:
-            return
-        seen[key] = now
-        print(f"\n[!] {row['timestamp']}  score {s:.4f}  severidad {severity(s, ref)}%")
-        print(f"    {key}  proto {row['proto']}  {row['length']} B "
-              f"(payload {row['payload_len']} B)")
+        pending.append(row)
+        if len(pending) >= args.batch or time.time() - last >= args.max_delay:
+            flush()
 
-    sniff(prn=handle, store=0, iface=args.iface, filter="ip", timeout=args.duration or None)
+    try:
+        sniff(prn=handle, store=0, iface=args.iface, filter="ip", timeout=args.duration or None)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        flush()
 
 
 def cmd_eval(args):
     import joblib
+    import matplotlib
+    if args.save:
+        matplotlib.use('Agg')  # sin ventana: para servidores sin escritorio
     import matplotlib.pyplot as plt
 
     b = joblib.load(args.model)
-    plt.hist(b['score_ref'], bins=80, color='steelblue')
-    plt.axvline(b['threshold'], color='crimson', ls='--', label=f"umbral {b['threshold']:.4f}")
+    ref, thr = b['score_ref'], b['threshold']
+    print(f"  muestras   {b.get('samples', '?')}")
+    print(f"  features   {', '.join(b['features'])}")
+    print(f"  umbral     {thr:.4f}")
+    for p in (0.5, 1, 5, 50, 95):
+        print(f"  p{p:<4g}      {np.percentile(ref, p):.4f}")
+    # Si el grueso de los scores cae pegado al umbral, el corte es arbitrario:
+    # separa paquetes casi identicos y el baseline no da para discriminar.
+    near = float((np.abs(ref - thr) < 0.005).mean())
+    if near > 0.005:
+        print(f"\n  [!] {near * 100:.1f}% de las muestras caen a menos de 0.005 del umbral.")
+        print("      El corte separa paquetes casi identicos: baseline poco representativo.")
+
+    plt.hist(ref, bins=80, color='steelblue')
+    plt.axvline(thr, color='crimson', ls='--', label=f"umbral {thr:.4f}")
     plt.xlabel('score de anomalia')
     plt.ylabel('muestras')
     plt.title(f"Distribucion de scores ({b.get('samples', '?')} muestras)")
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    if args.save:
+        plt.savefig(args.save, dpi=120)
+        print(f"\n  -> {args.save}")
+    else:
+        plt.show()
 
 
 # --------------------------------------------------------------------------- cli
@@ -206,7 +257,10 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
 
-    sub.add_parser('ifaces', help='lista interfaces').set_defaults(func=cmd_ifaces)
+    i = sub.add_parser('ifaces', help='lista interfaces')
+    i.add_argument('--all', action='store_true', help='incluye las que no tienen IP utilizable')
+    i.add_argument('-v', '--verbose', action='store_true', help='muestra el nombre interno')
+    i.set_defaults(func=cmd_ifaces)
 
     c = sub.add_parser('capture', help='captura pasiva a CSV')
     c.add_argument('--iface')
@@ -232,10 +286,14 @@ def main():
                    help='ignora paquetes menores (el default 128 original ocultaba ICMP y escaneos)')
     d.add_argument('--whitelist', type=int, nargs='*', default=[],
                    help='puertos a ignorar, p.ej. --whitelist 80 443 53')
+    d.add_argument('--batch', type=int, default=256, help='paquetes por lote a puntuar')
+    d.add_argument('--max-delay', type=float, default=2.0,
+                   help='segundos maximos que un paquete espera en el lote')
     d.set_defaults(func=cmd_detect)
 
     e = sub.add_parser('eval', help='distribucion de scores y umbral')
     e.add_argument('--model', default=MODEL)
+    e.add_argument('--save', metavar='PNG', help='guarda el grafico en vez de abrir ventana')
     e.set_defaults(func=cmd_eval)
 
     args = p.parse_args()

@@ -3,4 +3,7 @@ __pycache__/
 .venv/
 venv/
 *.pkl
-network_data*.csv
+*.log
+*.png
+*.csv
+!network_data.csv

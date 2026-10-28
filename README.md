@@ -52,13 +52,37 @@ trae `payload_len`.
 
 ## Limitaciones
 
-- Puntúa **paquetes sueltos**, no flujos. Un escaneo lento o un beacon C2 regular
-  pueden pasar desapercibidos: cada paquete suyo es individualmente normal.
-  Agregar por flujo (bytes, duración, nº de paquetes) es la mejora grande pendiente.
+Medido sobre una Wi-Fi doméstica (136.918 paquetes en 5 min, ~450 pkt/s),
+entrenando con 4 minutos y midiendo sobre el minuto siguiente no visto:
+
+| | |
+|---|---|
+| Alertas sobre tráfico normal no visto | 0,67 % |
+| En términos operativos | **181 alertas en 60 s = 3 por segundo** |
+| Concentración | 6,83 % del TCP, 0,00 % del UDP |
+
+**Esa es la limitación de fondo: puntúa paquetes sueltos, no flujos.** Un 0,67 %
+suena bien hasta que lo multiplicas por el volumen de paquetes — son ~10.000
+falsos positivos por hora, todos tráfico HTTPS corriente. Y al revés, un beacon
+C2 regular o un escaneo lento pasan desapercibidos, porque cada paquete suyo es
+individualmente normal.
+
+Agregar por flujo (bytes totales, duración, nº de paquetes, periodicidad) antes
+de puntuar es **la mejora que hace falta para que esto sea usable**, no un extra.
+
+Otras:
+
+- El modelo tiende a aprender "el protocolo mayoritario es lo normal". Con un
+  baseline de 60 s que era 91 % QUIC, marcaba el 11,6 % de todo el TCP. Con 5 min
+  y 76/24 bajó al 6,8 %. Hacen falta **horas** de baseline cubriendo el ciclo
+  diario, no minutos.
+- `eval` avisa cuando el grueso de los scores cae pegado al umbral: ahí el corte
+  separa paquetes casi idénticos y el baseline no da para discriminar.
 - `--min-length` y `--whitelist` vienen vacíos a propósito. Los valores del código
   original (128 bytes, puertos 80/443/53) escondían justo lo que interesa:
   ICMP, escaneos y el grueso del tráfico real.
-- Un `score_samples` por paquete (~1 ms). En enlaces cargados hay que puntuar por lotes.
+- Captura en Windows necesita Npcap. No hace falta ser administrador si Npcap se
+  instaló sin la restricción a administradores.
 
 ## Qué se quitó
 
