@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.pkl
+*.log
+*.png
+*.csv
+!network_data.csv
